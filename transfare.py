@@ -3,8 +3,9 @@ import shutil
 import hashlib
 import json
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
+import time
+import signal
+import sys
 
 # ==================== CONFIG ====================
 SOURCE_DIRS = [
@@ -19,144 +20,182 @@ IMAGE_EXTENSIONS = {
     '.nef', '.arw', '.dng', '.heic', '.heif', '.tiff',
     '.tif', '.bmp', '.mp4', '.mov', '.avi', '.mkv'
 }
-MAX_WORKERS = 6  # تعداد thread همزمان - میتونی بیشتر کنی
+CHUNK = 524_288      # 512KB برای hash
+COPY_BUF = 8 * 1024 * 1024  # 8MB buffer برای copy
 # ================================================
 
-lock = threading.Lock()
+# ---- برای Ctrl+C ----
+interrupted = False
 
-def get_partial_hash(filepath, bytes_to_read=1_048_576):  # فقط 1MB اول و آخر
-    """خیلی سریع‌تر از hash کامل - برای 99.9% کافیه"""
-    h = hashlib.xxhash.xxh64() if hasattr(hashlib, 'xxhash') else hashlib.md5()
+def handle_interrupt(sig, frame):
+    global interrupted
+    print("\n\n⚠️  Ctrl+C دریافت شد - در حال ذخیره و خروج...")
+    interrupted = True
+
+signal.signal(signal.SIGINT, handle_interrupt)
+# ---------------------
+
+def partial_hash(filepath):
     size = os.path.getsize(filepath)
+    h = hashlib.md5(usedforsecurity=False)
+    h.update(str(size).encode())
     with open(filepath, 'rb') as f:
-        # 1MB اول
-        h.update(f.read(bytes_to_read))
-        # 1MB آخر (اگه فایل بزرگه)
-        if size > bytes_to_read * 2:
-            f.seek(-bytes_to_read, 2)
-            h.update(f.read(bytes_to_read))
-        # size رو هم اضافه کن
-        h.update(str(size).encode())
+        h.update(f.read(CHUNK))
+        if size > CHUNK * 2:
+            f.seek(-CHUNK, 2)
+            h.update(f.read(CHUNK))
     return h.hexdigest()
 
-def load_progress():
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {
-        "copied_hashes": {},
-        "processed_files": [],
-        "skipped_duplicates": 0,
-        "copied_count": 0
-    }
+def fast_copy(src, dst):
+    with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+        while buf := fsrc.read(COPY_BUF):
+            fdst.write(buf)
+    shutil.copystat(src, dst)
 
-def save_progress(progress):
+def load_progress():
+    """با هر ساختاری که progress داشت کار میکنه"""
+    if not os.path.exists(PROGRESS_FILE):
+        return {"hashes": {}, "done": [], "copied": 0, "dupes": 0, "errors": []}
+    try:
+        with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+            old = json.load(f)
+        # normalize - هر کلیدی که نبود رو با default پر کن
+        return {
+            "hashes":  old.get("hashes")  or old.get("copied_hashes") or {},
+            "done":    old.get("done")    or old.get("processed_files") or [],
+            "copied":  old.get("copied")  or old.get("copied_count") or 0,
+            "dupes":   old.get("dupes")   or old.get("skipped_duplicates") or 0,
+            "errors":  old.get("errors")  or [],
+        }
+    except Exception as e:
+        print(f"⚠️  فایل progress خراب بود، از صفر شروع میکنیم: {e}")
+        return {"hashes": {}, "done": [], "copied": 0, "dupes": 0, "errors": []}
+
+def save_progress(p):
     os.makedirs(DEST_DIR, exist_ok=True)
     tmp = PROGRESS_FILE + ".tmp"
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(progress, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, PROGRESS_FILE)  # atomic write
+        json.dump(p, f, ensure_ascii=False)
+    os.replace(tmp, PROGRESS_FILE)
 
-def collect_all_files():
-    all_files = []
+def collect_files():
+    files = []
     for src_dir in SOURCE_DIRS:
         if not os.path.exists(src_dir):
-            print(f"⚠️  فولدر پیدا نشد: {src_dir}")
+            print(f"⚠️  پیدا نشد: {src_dir}")
             continue
-        for root, dirs, files in os.walk(src_dir):
-            for fname in files:
-                if Path(fname).suffix.lower() in IMAGE_EXTENSIONS:
-                    all_files.append(os.path.join(root, fname))
-    return all_files
+        for root, _, filenames in os.walk(src_dir):
+            for fn in filenames:
+                if Path(fn).suffix.lower() in IMAGE_EXTENSIONS:
+                    files.append(os.path.join(root, fn))
+    return files
 
-def get_unique_dest_name(dest_dir, filename):
-    dest_path = os.path.join(dest_dir, filename)
-    if not os.path.exists(dest_path):
-        return dest_path
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
-    counter = 1
+def get_dest_path(dest_dir, filename):
+    p = os.path.join(dest_dir, filename)
+    if not os.path.exists(p):
+        return p
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    i = 1
     while True:
-        new_path = os.path.join(dest_dir, f"{stem}_({counter}){suffix}")
-        if not os.path.exists(new_path):
-            return new_path
-        counter += 1
+        p = os.path.join(dest_dir, f"{stem}_({i}){suffix}")
+        if not os.path.exists(p):
+            return p
+        i += 1
 
-def process_file(src_path, progress, already_processed):
-    """پردازش یک فایل - برای thread pool"""
-    if src_path in already_processed:
-        return "skip_already", src_path, None
+def fmt_size(b):
+    for u in ['B', 'KB', 'MB', 'GB']:
+        if b < 1024:
+            return f"{b:.1f}{u}"
+        b /= 1024
+    return f"{b:.1f}TB"
 
-    try:
-        file_hash = get_partial_hash(src_path)
-        return "hash_done", src_path, file_hash
-    except Exception as e:
-        return "error", src_path, str(e)
+def fmt_time(s):
+    s = int(s)
+    if s < 60: return f"{s}s"
+    if s < 3600: return f"{s//60}m {s%60}s"
+    return f"{s//3600}h {(s%3600)//60}m"
 
 def main():
-    print("=" * 60)
-    print("📷  شروع انتقال تصاویر (حالت سریع)")
-    print(f"📁  مقصد: {DEST_DIR}")
-    print(f"⚡  threads: {MAX_WORKERS}")
-    print("=" * 60)
-
     os.makedirs(DEST_DIR, exist_ok=True)
-    progress = load_progress()
-    already_processed = set(progress["processed_files"])
-    copied_hashes = progress["copied_hashes"]
+    p = load_progress()
+    done_set = set(p["done"])
 
     print("🔍 جمع‌آوری فایل‌ها...")
-    all_files = collect_all_files()
+    all_files = collect_files()
     total = len(all_files)
-    remaining = [f for f in all_files if f not in already_processed]
-    print(f"✅ {total} فایل کل | {len(remaining)} باقیمانده\n")
+    remaining = [f for f in all_files if f not in done_set]
+    total_size = sum(os.path.getsize(f) for f in remaining)
 
-    completed = len(already_processed)
-    save_counter = 0
+    print(f"{'='*60}")
+    print(f"📦 کل فایل:       {total}")
+    print(f"⏳ باقیمانده:     {len(remaining)}")
+    print(f"💾 حجم باقیمانده: {fmt_size(total_size)}")
+    print(f"{'='*60}\n")
 
-    # hash کردن موازی
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(get_partial_hash, fp): fp
-            for fp in remaining
-        }
+    start_time = time.time()
+    processed_size = 0
 
-        for future in as_completed(futures):
-            src_path = futures[future]
-            completed += 1
-            pct = (completed / total) * 100
-            fname = os.path.basename(src_path)
+    for i, src in enumerate(remaining, 1):
+        if interrupted:
+            break
 
-            try:
-                file_hash = future.result()
+        fname = os.path.basename(src)
+        fsize = os.path.getsize(src)
+        pct = ((len(done_set) + i) / total * 100)
 
-                with lock:
-                    if file_hash in copied_hashes:
-                        print(f"[{pct:5.1f}%] 🔁 تکراری  {fname}")
-                        progress["skipped_duplicates"] += 1
-                    else:
-                        dest_path = get_unique_dest_name(DEST_DIR, fname)
-                        shutil.copy2(src_path, dest_path)
-                        copied_hashes[file_hash] = os.path.basename(dest_path)
-                        progress["copied_count"] += 1
-                        print(f"[{pct:5.1f}%] ✅ کپی      {fname}")
+        elapsed = time.time() - start_time
+        if processed_size > 0 and elapsed > 2:
+            speed = processed_size / elapsed
+            eta = fmt_time((total_size - processed_size) / speed)
+            speed_str = f"{fmt_size(speed)}/s"
+        else:
+            eta = "..."
+            speed_str = "..."
 
-                    progress["processed_files"].append(src_path)
-                    save_counter += 1
-                    if save_counter % 20 == 0:
-                        save_progress(progress)
+        print(f"[{pct:5.1f}%] [{i}/{len(remaining)}]  {fname}  ({fmt_size(fsize)})  🚀{speed_str}  ⏱{eta}")
 
-            except Exception as e:
-                print(f"[{pct:5.1f}%] ❌ خطا  {fname}: {e}")
+        try:
+            h = partial_hash(src)
 
-    save_progress(progress)
+            if h in p["hashes"]:
+                print(f"         🔁 تکراری = {p['hashes'][h]}")
+                p["dupes"] += 1
+            else:
+                dst = get_dest_path(DEST_DIR, fname)
+                fast_copy(src, dst)
+                p["hashes"][h] = os.path.basename(dst)
+                p["copied"] += 1
 
-    print("\n" + "=" * 60)
-    print("🎉 تموم شد!")
-    print(f"   ✅ کپی شد:       {progress['copied_count']} فایل")
-    print(f"   🔁 تکراری skip:  {progress['skipped_duplicates']} فایل")
-    print(f"   📁 مقصد:         {DEST_DIR}")
-    print("=" * 60)
+            p["done"].append(src)
+            done_set.add(src)
+            processed_size += fsize
+
+            if i % 25 == 0:
+                save_progress(p)
+
+        except Exception as e:
+            print(f"         ❌ خطا: {e}")
+            p["errors"].append({"file": src, "error": str(e)})
+
+    # همیشه آخر ذخیره کن - چه تموم شه چه Ctrl+C
+    save_progress(p)
+
+    if interrupted:
+        print(f"\n⏸️  متوقف شد - progress ذخیره شد")
+        print(f"   ✅ این دفعه کپی شد: {p['copied']} فایل")
+        print(f"   برای ادامه دوباره اجرا کن: python transfare.py")
+    else:
+        total_time = fmt_time(time.time() - start_time)
+        print(f"\n{'='*60}")
+        print(f"🎉 تموم شد!  ({total_time})")
+        print(f"   ✅ کپی شد:   {p['copied']} فایل")
+        print(f"   🔁 تکراری:   {p['dupes']} فایل")
+        print(f"   ❌ خطا:      {len(p['errors'])} فایل")
+        if p['errors']:
+            print(f"\n   فایل‌های خطادار:")
+            for e in p['errors']:
+                print(f"   - {e['file']}: {e['error']}")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     main()
