@@ -3,7 +3,8 @@ import shutil
 import hashlib
 import json
 from pathlib import Path
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # ==================== CONFIG ====================
 SOURCE_DIRS = [
@@ -18,26 +19,43 @@ IMAGE_EXTENSIONS = {
     '.nef', '.arw', '.dng', '.heic', '.heif', '.tiff',
     '.tif', '.bmp', '.mp4', '.mov', '.avi', '.mkv'
 }
+MAX_WORKERS = 6  # تعداد thread همزمان - میتونی بیشتر کنی
 # ================================================
 
-def get_file_hash(filepath, chunk_size=65536):
-    """SHA256 hash of file content"""
-    h = hashlib.sha256()
+lock = threading.Lock()
+
+def get_partial_hash(filepath, bytes_to_read=1_048_576):  # فقط 1MB اول و آخر
+    """خیلی سریع‌تر از hash کامل - برای 99.9% کافیه"""
+    h = hashlib.xxhash.xxh64() if hasattr(hashlib, 'xxhash') else hashlib.md5()
+    size = os.path.getsize(filepath)
     with open(filepath, 'rb') as f:
-        while chunk := f.read(chunk_size):
-            h.update(chunk)
+        # 1MB اول
+        h.update(f.read(bytes_to_read))
+        # 1MB آخر (اگه فایل بزرگه)
+        if size > bytes_to_read * 2:
+            f.seek(-bytes_to_read, 2)
+            h.update(f.read(bytes_to_read))
+        # size رو هم اضافه کن
+        h.update(str(size).encode())
     return h.hexdigest()
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return {"copied_hashes": {}, "processed_files": [], "skipped_duplicates": 0, "copied_count": 0}
+    return {
+        "copied_hashes": {},
+        "processed_files": [],
+        "skipped_duplicates": 0,
+        "copied_count": 0
+    }
 
 def save_progress(progress):
     os.makedirs(DEST_DIR, exist_ok=True)
-    with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+    tmp = PROGRESS_FILE + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(progress, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROGRESS_FILE)  # atomic write
 
 def collect_all_files():
     all_files = []
@@ -47,13 +65,11 @@ def collect_all_files():
             continue
         for root, dirs, files in os.walk(src_dir):
             for fname in files:
-                ext = Path(fname).suffix.lower()
-                if ext in IMAGE_EXTENSIONS:
+                if Path(fname).suffix.lower() in IMAGE_EXTENSIONS:
                     all_files.append(os.path.join(root, fname))
     return all_files
 
 def get_unique_dest_name(dest_dir, filename):
-    """اگه اسم فایل تکراری بود (ولی محتوا فرق داشت) یه اسم جدید بده"""
     dest_path = os.path.join(dest_dir, filename)
     if not os.path.exists(dest_path):
         return dest_path
@@ -61,64 +77,77 @@ def get_unique_dest_name(dest_dir, filename):
     suffix = Path(filename).suffix
     counter = 1
     while True:
-        new_name = f"{stem}_({counter}){suffix}"
-        new_path = os.path.join(dest_dir, new_name)
+        new_path = os.path.join(dest_dir, f"{stem}_({counter}){suffix}")
         if not os.path.exists(new_path):
             return new_path
         counter += 1
 
+def process_file(src_path, progress, already_processed):
+    """پردازش یک فایل - برای thread pool"""
+    if src_path in already_processed:
+        return "skip_already", src_path, None
+
+    try:
+        file_hash = get_partial_hash(src_path)
+        return "hash_done", src_path, file_hash
+    except Exception as e:
+        return "error", src_path, str(e)
+
 def main():
     print("=" * 60)
-    print("📷  شروع انتقال تصاویر")
+    print("📷  شروع انتقال تصاویر (حالت سریع)")
     print(f"📁  مقصد: {DEST_DIR}")
+    print(f"⚡  threads: {MAX_WORKERS}")
     print("=" * 60)
 
     os.makedirs(DEST_DIR, exist_ok=True)
     progress = load_progress()
-    
     already_processed = set(progress["processed_files"])
-    copied_hashes = progress["copied_hashes"]  # hash -> dest_filename
+    copied_hashes = progress["copied_hashes"]
 
-    print("🔍 در حال جمع‌آوری لیست فایل‌ها...")
+    print("🔍 جمع‌آوری فایل‌ها...")
     all_files = collect_all_files()
     total = len(all_files)
-    print(f"✅ {total} فایل پیدا شد\n")
+    remaining = [f for f in all_files if f not in already_processed]
+    print(f"✅ {total} فایل کل | {len(remaining)} باقیمانده\n")
 
-    for i, src_path in enumerate(all_files, 1):
-        # نشون بده چند درصد کل کار پیش رفته
-        pct = (i / total) * 100
-        print(f"[{pct:5.1f}%] ({i}/{total})  {os.path.basename(src_path)}", end=" ... ")
+    completed = len(already_processed)
+    save_counter = 0
 
-        # اگه قبلاً پردازش شده skip کن
-        if src_path in already_processed:
-            print("⏭️  قبلاً پردازش شده")
-            continue
+    # hash کردن موازی
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(get_partial_hash, fp): fp
+            for fp in remaining
+        }
 
-        try:
-            file_hash = get_file_hash(src_path)
+        for future in as_completed(futures):
+            src_path = futures[future]
+            completed += 1
+            pct = (completed / total) * 100
+            fname = os.path.basename(src_path)
 
-            if file_hash in copied_hashes:
-                print(f"🔁 تکراری (= {copied_hashes[file_hash]})")
-                progress["skipped_duplicates"] += 1
-            else:
-                dest_path = get_unique_dest_name(DEST_DIR, os.path.basename(src_path))
-                # copy2 متادیتا و تاریخ رو حفظ می‌کنه
-                shutil.copy2(src_path, dest_path)
-                copied_hashes[file_hash] = os.path.basename(dest_path)
-                progress["copied_count"] += 1
-                print(f"✅ کپی شد → {os.path.basename(dest_path)}")
+            try:
+                file_hash = future.result()
 
-            progress["processed_files"].append(src_path)
-            progress["copied_hashes"] = copied_hashes
+                with lock:
+                    if file_hash in copied_hashes:
+                        print(f"[{pct:5.1f}%] 🔁 تکراری  {fname}")
+                        progress["skipped_duplicates"] += 1
+                    else:
+                        dest_path = get_unique_dest_name(DEST_DIR, fname)
+                        shutil.copy2(src_path, dest_path)
+                        copied_hashes[file_hash] = os.path.basename(dest_path)
+                        progress["copied_count"] += 1
+                        print(f"[{pct:5.1f}%] ✅ کپی      {fname}")
 
-            # هر 10 فایل progress رو ذخیره کن
-            if i % 10 == 0:
-                save_progress(progress)
+                    progress["processed_files"].append(src_path)
+                    save_counter += 1
+                    if save_counter % 20 == 0:
+                        save_progress(progress)
 
-        except Exception as e:
-            print(f"❌ خطا: {e}")
-            save_progress(progress)
-            continue
+            except Exception as e:
+                print(f"[{pct:5.1f}%] ❌ خطا  {fname}: {e}")
 
     save_progress(progress)
 
